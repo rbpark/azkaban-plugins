@@ -63,8 +63,6 @@ public abstract class HadoopSecurityManager {
 		return shouldProxy != null && shouldProxy.equals("true");
 	}
 	
-	public abstract void prefetchToken(File tokenFile, String userToProxy, Logger logger) throws HadoopSecurityManagerException;
-	
 	public abstract void cancelTokens(File tokenFile, String userToProxy, Logger logger) throws HadoopSecurityManagerException;
 	
 	public abstract void prefetchToken(File tokenFile, Props props, Logger logger) throws HadoopSecurityManagerException;

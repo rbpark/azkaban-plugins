@@ -25,7 +25,9 @@ import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapred.JobClient;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapreduce.security.token.delegation.DelegationTokenIdentifier;
+import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.security.Credentials;
+import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.security.token.TokenIdentifier;
@@ -48,8 +50,18 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
-public class HadoopSecurityManager_H_1_0 extends HadoopSecurityManager {
+public class HadoopSecurityManager_H_2_0 extends HadoopSecurityManager {
+	/** The Kerberos principal for the job tracker. */
+	public static final String JT_PRINCIPAL = "mapreduce.jobtracker.kerberos.principal";
+	/** The Kerberos principal for the resource manager. */
+	public static final String RM_PRINCIPAL = "yarn.resourcemanager.principal";
 
+	public static final String HADOOP_JOB_TRACKER = "mapred.job.tracker";
+	public static final String HADOOP_JOB_TRACKER_2 = "mapreduce.jobtracker.address";
+	public static final String HADOOP_YARN_RM = "yarn.resourcemanager.address";
+
+	public static final Text DEFAULT_RENEWER = new Text("azkaban mr tokens");
+	
 	private UserGroupInformation loginUser = null;
 	private final static Logger logger = Logger.getLogger(HadoopSecurityManager.class);
 	private Configuration conf;
@@ -68,7 +80,7 @@ public class HadoopSecurityManager_H_1_0 extends HadoopSecurityManager {
 
 	private static URLClassLoader ucl;
 
-	private HadoopSecurityManager_H_1_0(Props props) throws HadoopSecurityManagerException, IOException {
+	private HadoopSecurityManager_H_2_0(Props props) throws HadoopSecurityManagerException, IOException {
 		
 		// for now, assume the same/compatible native library, the same/compatible hadoop-core jar
 		String hadoopHome = props.getString("hadoop.home", null);
@@ -180,10 +192,10 @@ public class HadoopSecurityManager_H_1_0 extends HadoopSecurityManager {
 	
 	public static HadoopSecurityManager getInstance(Props props) throws HadoopSecurityManagerException, IOException {
 		if(hsmInstance == null) {
-			synchronized (HadoopSecurityManager_H_1_0.class) {
+			synchronized (HadoopSecurityManager_H_2_0.class) {
 				if(hsmInstance == null) {
 						logger.info("getting new instance");
-						hsmInstance = new HadoopSecurityManager_H_1_0(props);
+						hsmInstance = new HadoopSecurityManager_H_2_0(props);
 				}
 			}
 		}
@@ -315,9 +327,7 @@ public class HadoopSecurityManager_H_1_0 extends HadoopSecurityManager {
 							return null;
 						}							
 						private void cancelToken(Token<DelegationTokenIdentifier> jt) throws IOException, InterruptedException   {
-							JobConf jc = new JobConf(conf);
-							JobClient jobClient = new JobClient(jc);
-							jobClient.cancelDelegationToken(jt);
+							jt.cancel(conf);
 						}
 				}
 			);
@@ -378,9 +388,10 @@ public class HadoopSecurityManager_H_1_0 extends HadoopSecurityManager {
 		final String userToProxy = props.getString(USER_TO_PROXY);
 		
 		logger.info("Getting hadoop tokens for "+userToProxy);
-		
+
 		final Credentials cred = new Credentials();
 
+		// This is outside the do-as, because HCAT and HIVE don't use Kerberos auth.
 		if(props.getBoolean(OBTAIN_HCAT_TOKEN, false)) {
 			try {
 				logger.info("Pre-fetching Hive MetaStore token from hive");
@@ -416,45 +427,92 @@ public class HadoopSecurityManager_H_1_0 extends HadoopSecurityManager {
 				new PrivilegedExceptionAction<Void>() {
 						@Override
 						public Void run() throws Exception {
-							getToken(userToProxy);
+							JobConf jc = new JobConf(conf);
+							getFSToken(jc);
+							getMRToken(jc);
+							
+							writeTokensToFile(jc);
 							return null;
 						}
-						private void getToken(String userToProxy) throws InterruptedException,IOException, HadoopSecurityManagerException {
-							logger.info("Here is the props for " + OBTAIN_NAMENODE_TOKEN + ": " + props.getBoolean(OBTAIN_NAMENODE_TOKEN));
-							if(props.getBoolean(OBTAIN_NAMENODE_TOKEN, false)) {
-								//logger.info("Pre-fetching DFS token");
-								FileSystem fs = FileSystem.get(conf);
-								// check if we get the correct FS, and most importantly, the conf
-								logger.info("Getting DFS token from " + fs.getUri());
-								Token<?> fsToken = fs.getDelegationToken(userToProxy);
-								if(fsToken == null) {
-									logger.error("Failed to fetch DFS token for ");
-									throw new HadoopSecurityManagerException("Failed to fetch DFS token for " + userToProxy);
-								}							
-								logger.info("Created DFS token: " + fsToken.toString());
-								logger.info("Token kind: " + fsToken.getKind());
-								logger.info("Token id: " + fsToken.getIdentifier());
-								logger.info("Token service: " + fsToken.getService());
-								cred.addToken(fsToken.getService(), fsToken);
-//								nnTokens.put(tokenFile.getName(), fsToken);
+						
+						private void getFSToken(JobConf jc) throws IOException {
+							logger.info("Fetching DFS token for " + userToProxy);
+							FileSystem fs = FileSystem.get(conf);
+							
+							logger.info("Getting DFS token from " + fs.getCanonicalServiceName() + fs.getUri());
+							Token<?> fsToken = fs.getDelegationToken("yarn");
+							if(fsToken == null) {
+								logger.error("Failed to fetch DFS token for ");
+								throw new IOException("Failed to fetch DFS token for " + userToProxy);
+							}	
+							
+							logger.info("Created DFS token: " + fsToken.toString());
+							logger.info("DFS Token kind: " + fsToken.getKind());
+							logger.info("DFS Token id: " + fsToken.getIdentifier());
+							logger.info("DFS Token service: " + fsToken.getService());
+							jc.getCredentials().addToken(fsToken.getService(), fsToken);
+						}
+						
+						private void getMRToken(JobConf jc) throws IOException, InterruptedException {
+							logger.info("Fetching JT token for " + userToProxy);
+							JobClient jobClient = new JobClient(jc);
+							
+							Token<DelegationTokenIdentifier> mrdt = jobClient.getDelegationToken(getMRTokenRenewerInternal(jc));
+							if(mrdt == null) {
+								throw new IOException("Failed to fetch JT token for " + userToProxy);
 							}
+							
+							logger.info("Created MR token: " + mrdt.toString());
+							logger.info("MR Token kind: " + mrdt.getKind());
+							logger.info("MR Token id: " + mrdt.getIdentifier());
+							logger.info("MR Token service: " + mrdt.getService());
+							jc.getCredentials().addToken(mrdt.getService(), mrdt);
+						}
+						
+						private void writeTokensToFile(JobConf conf) throws IOException {
+							logger.info("Log tokens out to file.");
+							
+							FileOutputStream fos = null;
+							DataOutputStream dos = null;
+							try {
+								fos = new FileOutputStream(tokenFile);
+								dos = new DataOutputStream(fos);
+								conf.getCredentials().writeTokenStorageToStream(dos);
+							} finally {
+								if (dos != null) {
+									dos.close();
+								}
+								if (fos != null) {
+									fos.close();
+								}
+							}
+
+							logger.info("Tokens loaded in " + tokenFile.getAbsolutePath());
+						}
+
+						private Text getMRTokenRenewerInternal(JobConf jobConf) throws IOException {
+							// Taken from Oozie
+							//
+							// Getting renewer correctly for JT principal also though JT in hadoop
+							// 1.x does not have
+							// support for renewing/cancelling tokens
+							String servicePrincipal = jobConf.get(RM_PRINCIPAL, jobConf.get(JT_PRINCIPAL));
+							Text renewer;
+							if (servicePrincipal != null) {
+								String target = jobConf.get(HADOOP_YARN_RM,jobConf.get(HADOOP_JOB_TRACKER_2));
+								if (target == null) {
+									target = jobConf.get(HADOOP_JOB_TRACKER);
+								}
 								
-							if(props.getBoolean(OBTAIN_JOBTRACKER_TOKEN, false)) {	
-								JobClient jobClient = new JobClient(new JobConf());
-								logger.info("Pre-fetching JT token from JobTracker");
-		
-								Token<DelegationTokenIdentifier> mrdt = jobClient.getDelegationToken(new Text("mr token"));
-								if(mrdt == null) {
-									logger.error("Failed to fetch JT token");
-									throw new HadoopSecurityManagerException("Failed to fetch JT token for " + userToProxy);
-								}							
-								logger.info("Created JT token: " + mrdt.toString());
-								logger.info("Token kind: " + mrdt.getKind());
-								logger.info("Token id: " + mrdt.getIdentifier());
-								logger.info("Token service: " + mrdt.getService());
-								cred.addToken(mrdt.getService(), mrdt);
-//								jtTokens.put(tokenFile.getName(), mrdt);
+								String addr = NetUtils.createSocketAddr(target).getHostName();
+								renewer = new Text(SecurityUtil.getServerPrincipal(servicePrincipal, addr));
 							}
+							else {
+								// No security
+								renewer = DEFAULT_RENEWER;
+							}
+							
+							return renewer;
 						}
 				}
 			);
