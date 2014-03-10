@@ -80,12 +80,6 @@ public class DefaultHadoopSecurityManager extends HadoopSecurityManager {
 	}
 
 	@Override
-	public void prefetchToken(File tokenFile, String userToProxy, Logger logger)
-			throws HadoopSecurityManagerException {
-		throw new HadoopSecurityManagerException("No real Hadoop Security Manager is set!");		
-	}
-
-	@Override
 	public void cancelTokens(File tokenFile, String userToProxy, Logger logger)
 			throws HadoopSecurityManagerException {
 		// TODO Auto-generated method stub

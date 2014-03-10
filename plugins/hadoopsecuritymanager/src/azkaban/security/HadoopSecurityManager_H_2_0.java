@@ -388,8 +388,7 @@ public class HadoopSecurityManager_H_2_0 extends HadoopSecurityManager {
 		final String userToProxy = props.getString(USER_TO_PROXY);
 		
 		logger.info("Getting hadoop tokens for "+userToProxy);
-
-		final Credentials cred = new Credentials();
+		final JobConf jc = new JobConf(conf);
 
 		// This is outside the do-as, because HCAT and HIVE don't use Kerberos auth.
 		if(props.getBoolean(OBTAIN_HCAT_TOKEN, false)) {
@@ -411,7 +410,7 @@ public class HadoopSecurityManager_H_2_0 extends HadoopSecurityManager {
 				logger.info("Token kind: " + hcatToken.getKind());
 				logger.info("Token id: " + hcatToken.getIdentifier());
 				logger.info("Token service: " + hcatToken.getService());
-				cred.addToken(hcatToken.getService(), hcatToken);
+				jc.getCredentials().addToken(hcatToken.getService(), hcatToken);
 			} catch (Exception e) {
 				e.printStackTrace();
 				logger.error("Failed to get hive metastore token." + e.getMessage() + e.getCause());
@@ -425,114 +424,98 @@ public class HadoopSecurityManager_H_2_0 extends HadoopSecurityManager {
 			getProxiedUser(userToProxy).doAs(
 			//UserGroupInformation.getCurrentUser().doAs(
 				new PrivilegedExceptionAction<Void>() {
-						@Override
-						public Void run() throws Exception {
-							JobConf jc = new JobConf(conf);
-							getFSToken(jc);
-							getMRToken(jc);
-							
-							writeTokensToFile(jc);
-							return null;
+					@Override
+					public Void run() throws Exception {
+						getFSToken(jc);
+						getMRToken(jc);
+						
+						writeTokensToFile(jc);
+						return null;
+					}
+					
+					private void getFSToken(JobConf jc) throws IOException {
+						logger.info("Fetching DFS token for " + userToProxy);
+						FileSystem fs = FileSystem.get(conf);
+						
+						logger.info("Getting DFS token from " + fs.getCanonicalServiceName() + fs.getUri());
+						Token<?> fsToken = fs.getDelegationToken("yarn");
+						if(fsToken == null) {
+							logger.error("Failed to fetch DFS token for ");
+							throw new IOException("Failed to fetch DFS token for " + userToProxy);
+						}	
+						
+						logger.info("Created DFS token: " + fsToken.toString());
+						logger.info("DFS Token kind: " + fsToken.getKind());
+						logger.info("DFS Token id: " + fsToken.getIdentifier());
+						logger.info("DFS Token service: " + fsToken.getService());
+						jc.getCredentials().addToken(fsToken.getService(), fsToken);
+					}
+					
+					private void getMRToken(JobConf jc) throws IOException, InterruptedException {
+						logger.info("Fetching JT token for " + userToProxy);
+						JobClient jobClient = new JobClient(jc);
+						
+						Token<DelegationTokenIdentifier> mrdt = jobClient.getDelegationToken(getMRTokenRenewerInternal(jc));
+						if(mrdt == null) {
+							throw new IOException("Failed to fetch JT token for " + userToProxy);
 						}
 						
-						private void getFSToken(JobConf jc) throws IOException {
-							logger.info("Fetching DFS token for " + userToProxy);
-							FileSystem fs = FileSystem.get(conf);
-							
-							logger.info("Getting DFS token from " + fs.getCanonicalServiceName() + fs.getUri());
-							Token<?> fsToken = fs.getDelegationToken("yarn");
-							if(fsToken == null) {
-								logger.error("Failed to fetch DFS token for ");
-								throw new IOException("Failed to fetch DFS token for " + userToProxy);
-							}	
-							
-							logger.info("Created DFS token: " + fsToken.toString());
-							logger.info("DFS Token kind: " + fsToken.getKind());
-							logger.info("DFS Token id: " + fsToken.getIdentifier());
-							logger.info("DFS Token service: " + fsToken.getService());
-							jc.getCredentials().addToken(fsToken.getService(), fsToken);
-						}
-						
-						private void getMRToken(JobConf jc) throws IOException, InterruptedException {
-							logger.info("Fetching JT token for " + userToProxy);
-							JobClient jobClient = new JobClient(jc);
-							
-							Token<DelegationTokenIdentifier> mrdt = jobClient.getDelegationToken(getMRTokenRenewerInternal(jc));
-							if(mrdt == null) {
-								throw new IOException("Failed to fetch JT token for " + userToProxy);
-							}
-							
-							logger.info("Created MR token: " + mrdt.toString());
-							logger.info("MR Token kind: " + mrdt.getKind());
-							logger.info("MR Token id: " + mrdt.getIdentifier());
-							logger.info("MR Token service: " + mrdt.getService());
-							jc.getCredentials().addToken(mrdt.getService(), mrdt);
-						}
-						
-						private void writeTokensToFile(JobConf conf) throws IOException {
-							logger.info("Log tokens out to file.");
-							
-							FileOutputStream fos = null;
-							DataOutputStream dos = null;
-							try {
-								fos = new FileOutputStream(tokenFile);
-								dos = new DataOutputStream(fos);
-								conf.getCredentials().writeTokenStorageToStream(dos);
-							} finally {
-								if (dos != null) {
-									dos.close();
-								}
-								if (fos != null) {
-									fos.close();
-								}
-							}
+						logger.info("Created MR token: " + mrdt.toString());
+						logger.info("MR Token kind: " + mrdt.getKind());
+						logger.info("MR Token id: " + mrdt.getIdentifier());
+						logger.info("MR Token service: " + mrdt.getService());
+						jc.getCredentials().addToken(mrdt.getService(), mrdt);
+					}
 
-							logger.info("Tokens loaded in " + tokenFile.getAbsolutePath());
-						}
-
-						private Text getMRTokenRenewerInternal(JobConf jobConf) throws IOException {
-							// Taken from Oozie
-							//
-							// Getting renewer correctly for JT principal also though JT in hadoop
-							// 1.x does not have
-							// support for renewing/cancelling tokens
-							String servicePrincipal = jobConf.get(RM_PRINCIPAL, jobConf.get(JT_PRINCIPAL));
-							Text renewer;
-							if (servicePrincipal != null) {
-								String target = jobConf.get(HADOOP_YARN_RM,jobConf.get(HADOOP_JOB_TRACKER_2));
-								if (target == null) {
-									target = jobConf.get(HADOOP_JOB_TRACKER);
-								}
-								
-								String addr = NetUtils.createSocketAddr(target).getHostName();
-								renewer = new Text(SecurityUtil.getServerPrincipal(servicePrincipal, addr));
-							}
-							else {
-								// No security
-								renewer = DEFAULT_RENEWER;
+					private Text getMRTokenRenewerInternal(JobConf jobConf) throws IOException {
+						// Taken from Oozie
+						//
+						// Getting renewer correctly for JT principal also though JT in hadoop
+						// 1.x does not have
+						// support for renewing/cancelling tokens
+						String servicePrincipal = jobConf.get(RM_PRINCIPAL, jobConf.get(JT_PRINCIPAL));
+						Text renewer;
+						if (servicePrincipal != null) {
+							String target = jobConf.get(HADOOP_YARN_RM,jobConf.get(HADOOP_JOB_TRACKER_2));
+							if (target == null) {
+								target = jobConf.get(HADOOP_JOB_TRACKER);
 							}
 							
-							return renewer;
+							String addr = NetUtils.createSocketAddr(target).getHostName();
+							renewer = new Text(SecurityUtil.getServerPrincipal(servicePrincipal, addr));
 						}
+						else {
+							// No security
+							renewer = DEFAULT_RENEWER;
+						}
+						
+						return renewer;
+					}
+					
+					
+					private void writeTokensToFile(JobConf conf) throws IOException {
+						logger.info("Log tokens out to file.");
+						
+						FileOutputStream fos = null;
+						DataOutputStream dos = null;
+						try {
+							fos = new FileOutputStream(tokenFile);
+							dos = new DataOutputStream(fos);
+							conf.getCredentials().writeTokenStorageToStream(dos);
+						} finally {
+							if (dos != null) {
+								dos.close();
+							}
+							if (fos != null) {
+								fos.close();
+							}
+						}
+
+						logger.info("Tokens loaded in " + tokenFile.getAbsolutePath());
+					}
 				}
 			);
-			
-			FileOutputStream fos = null;
-			DataOutputStream dos = null;
-			try {
-				fos = new FileOutputStream(tokenFile);
-				dos = new DataOutputStream(fos);
-				cred.writeTokenStorageToStream(dos);
-			} finally {
-				if (dos != null) {
-					dos.close();
-				}
-				if (fos != null) {
-					fos.close();
-				}
-			}
-			// stash them to cancel after use.
-	
+
 			//System.out.println("Total tokens: nn " + nnTokens.size() + " jt " + jtTokens.size());
 			logger.info("Tokens loaded in " + tokenFile.getAbsolutePath());
 			
